@@ -1,16 +1,8 @@
 #include "cuda.h"
 #include "cuda_runtime.h"
+#include "gtest/gtest.h"
 #include <absl/types/span.h>
-#include <algorithm>
-#include <chrono>
-#include <cuda.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 #include <fstream>
-#include <iostream>
-#include <memory>
-#include <mma.h>
-#include <vector>
 
 template <class T>
 static CUresult LaunchKernel(CUfunction f, unsigned grid_x, unsigned block_x,
@@ -138,13 +130,27 @@ __global__ void wave_compute(ModelParams *d_model_params,
                              CellParams *d_cell_params, int step_start_num,
                              int layer_start_num);
 
-int main() {
-  std::vector<float> input(sizeof(CellState) * kLstmTimestep / sizeof(float));
-  std::vector<float> model(sizeof(ModelParams));
-  std::vector<float> output_buffer(sizeof(CellState) * kLstmTimestep /
-                                   sizeof(float));
-  absl::Span<float> output(output_buffer);
+std::vector<float> ReadFloatFromFile(const std::string &path) {
+  std::ifstream in_file(path);
+  in_file.setf(std::ios::fixed, std::ios::floatfield);
+  return std::vector<float>(std::istream_iterator<float>(in_file),
+                            std::istream_iterator<float>());
+}
+
+TEST(TestLSTM, test_wavefront_lstm) {
+  auto model = ReadFloatFromFile("model_params.txt");
+  auto input = ReadFloatFromFile("input_params.txt");
+  auto expect_result = ReadFloatFromFile("expect_results.txt");
+  std::vector<float> output_result_buffer(expect_result.size());
+  absl::Span<float> output(output_result_buffer);
   auto network = new WavefrontLSTM(model);
+
+  ASSERT_TRUE(network->Initialize(input));
+  network->Solve();
+  ASSERT_TRUE(network->Fetch(output));
+  for (unsigned int i = 0; i < expect_result.size(); ++i) {
+    ASSERT_NEAR(output[i], expect_result[i], 1e-5);
+  }
 
   enum { kWarmUp = 200, kLoop = 1000 };
   // Warm-up, 100 times
@@ -173,8 +179,6 @@ int main() {
          total_ms / kLoop);
 
   network->Finalize();
-
-  return 0;
 }
 
 Wave::Wave() {

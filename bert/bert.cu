@@ -1,16 +1,11 @@
+#include "gtest/gtest.h"
 #include <absl/types/span.h>
-#include <chrono>
-#include <cmath>
 #include <cooperative_groups.h>
 #include <cuda.h>
 #include <cuda/pipeline>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <fstream>
-#include <iostream>
-#include <memory>
-#include <mma.h>
-#include <vector>
 
 template <class T>
 static CUresult LaunchKernel(CUfunction f, unsigned grid_x, unsigned block_x,
@@ -257,13 +252,27 @@ __global__ void add_bias_gelu(BertInput *out,
 __global__ void softmax(half *qk_buf_, const half *attr_mask,
                         const half scalar);
 
-int main() {
-  std::vector<float> input(sizeof(BertInput));
-  std::vector<float> model(sizeof(BertAttrMask) + sizeof(BertWeight) * 12 +
-                           sizeof(BertWordVec) * 13);
-  std::vector<float> output_buffer(sizeof(BertInput));
-  absl::Span<float> output(output_buffer);
+std::vector<float> ReadFloatFromFile(const std::string &path) {
+  std::ifstream in_file(path);
+  in_file.setf(std::ios::fixed, std::ios::floatfield);
+  return std::vector<float>(std::istream_iterator<float>(in_file),
+                            std::istream_iterator<float>());
+}
+
+TEST(TestBERT, test_bert) {
+  auto model = ReadFloatFromFile("bert_model_params.txt");
+  auto input = ReadFloatFromFile("bert_input_params.txt");
+  auto expect_result = ReadFloatFromFile("bert_expect_results.txt");
+  std::vector<float> output_result_buffer(expect_result.size());
+  absl::Span<float> output(output_result_buffer);
   auto network = new Bert(model);
+
+  ASSERT_TRUE(network->Initialize(input));
+  network->Solve();
+  ASSERT_TRUE(network->Fetch(output));
+  for (unsigned int i = 0; i < expect_result.size(); ++i) {
+    ASSERT_NEAR(output[i], expect_result[i], 1e-5);
+  }
 
   enum { kWarmUp = 200, kLoop = 1000 };
   // Warm-up, 100 times
@@ -292,8 +301,6 @@ int main() {
          total_ms / kLoop);
 
   network->Finalize();
-
-  return 0;
 }
 
 void Attention::Initialize(AttentionParam param, int max_shm_per_block) {
