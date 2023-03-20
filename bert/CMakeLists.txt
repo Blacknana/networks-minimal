@@ -8,3 +8,6 @@ file(ARCHIVE_EXTRACT INPUT ${bert_data_path})
 
 add_executable(bert bert.cu)
 target_link_libraries(bert gtest gtest_main CUDA::cuda_driver absl::base)
+
+add_executable(bert_base base.cu)
+target_link_libraries(bert_base gtest gtest_main CUDA::cuda_driver absl::base)

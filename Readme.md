@@ -8,5 +8,5 @@
 #### Modefied in Libraries
 
 - ```cuda/include/cuda/std/barrier```
-- ```cuda/include/crt/mma.h```
+- ```cuda/include/crt/mma.hpp```
 - ```llvm-project/clang/include/clang/Basic/BuiltinsNVPTX.def```
