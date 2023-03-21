@@ -259,36 +259,50 @@ std::vector<float> ReadFloatFromFile(const std::string &path) {
                             std::istream_iterator<float>());
 }
 
-TEST(TestBERT, test_bert) {
+TEST(TestBERT, test_bert_base) {
   auto model = ReadFloatFromFile("bert_model_params.txt");
   auto input = ReadFloatFromFile("bert_input_params.txt");
+  std::vector<half> model_fp16(model.size());
+  std::vector<half> input_fp16(input.size());
+  for (unsigned int i = 0; i < model.size(); ++i) {
+    model_fp16[i] = static_cast<half>(model[i]);
+  }
+  for (unsigned int i = 0; i < input.size(); ++i) {
+    input_fp16[i] = static_cast<half>(input[i]);
+  }
   auto expect_result = ReadFloatFromFile("bert_expect_results.txt");
-  std::vector<float> output_result_buffer(expect_result.size());
-  absl::Span<float> output(output_result_buffer);
-  auto network = new Bert(model);
+  std::vector<half> output_result_fp16(expect_result.size());
+  auto network =
+      new Bert({reinterpret_cast<float *>(&model_fp16[0]), model_fp16.size()});
 
-  ASSERT_TRUE(network->Initialize(input));
+  ASSERT_TRUE(network->Initialize(
+      {reinterpret_cast<float *>(&input_fp16[0]), input_fp16.size()}));
   network->Solve();
-  ASSERT_TRUE(network->Fetch(output));
+  ASSERT_TRUE(network->Fetch({reinterpret_cast<float *>(&output_result_fp16[0]),
+                              output_result_fp16.size()}));
   for (unsigned int i = 0; i < expect_result.size(); ++i) {
-    ASSERT_NEAR(output[i], expect_result[i], 1e-5);
+    ASSERT_NEAR(output_result_fp16[i], expect_result[i], 1e-5);
   }
 
   enum { kWarmUp = 200, kLoop = 1000 };
   // Warm-up, 100 times
   for (int i = 0; i < kWarmUp; i++) {
-    network->Initialize(input);
+    network->Initialize(
+        {reinterpret_cast<float *>(&input_fp16[0]), input_fp16.size()});
     network->Solve();
-    network->Fetch(output);
+    network->Fetch({reinterpret_cast<float *>(&output_result_fp16[0]),
+                    output_result_fp16.size()});
   }
   double min_ms = std::numeric_limits<double>::max();
   double max_ms = std::numeric_limits<double>::min();
   double total_ms = 0.00000f;
   for (int i = 0; i < kLoop; i++) {
     auto start = std::chrono::steady_clock::now();
-    network->Initialize(input);
+    network->Initialize(
+        {reinterpret_cast<float *>(&input_fp16[0]), input_fp16.size()});
     network->Solve();
-    network->Fetch(output);
+    network->Fetch({reinterpret_cast<float *>(&output_result_fp16[0]),
+                    output_result_fp16.size()});
     auto end = std::chrono::steady_clock::now();
     std::chrono::duration<double, std::micro> elapsed = end - start;
     double iteration_ms = elapsed.count();
@@ -337,7 +351,7 @@ void Attention::Solve() {
       param_.d_self_attention.d_query_bias, d_query_buf_};
   const int gemm_k1_blocks =
       (n / (kBlockRowWarps * kGemmK1WarpRowTiles * kWmmaM)) *
-      (m / (kBlockColWarps * kGemmK1WarpColTiles * kWmmaN)) * kGemmK1BatchedNum;
+      (m / (kBlockColWarps * kGemmK1WarpColTiles * kWmmaN));
   const int gemm_k1_shared_mem =
       (kStage *
        (3 * kChunkK * kWmmaK *
