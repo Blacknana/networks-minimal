@@ -69,95 +69,62 @@ struct ModelParams {
 };
 #pragma pack(pop)
 
-struct StepInput {
+struct CellState {
   float data[kHiddenSize];
 };
 
-struct CellRuntime {
-  float state_h[kHiddenSize];
-  float state_c[kHiddenSize];
-  float gemvw_temp[kLstmGateNumber][kHiddenSize];
-  float gemvu_temp[kLstmGateNumber][kHiddenSize];
+struct CellTemp {
+  float data[kLstmGateNumber][kHiddenSize];
 };
-static_assert(sizeof(CellRuntime) == sizeof(CellRuntime::state_h) +
-                                         sizeof(CellRuntime::state_c) +
-                                         sizeof(CellRuntime::gemvw_temp) +
-                                         sizeof(CellRuntime::gemvu_temp),
-              "Expect the data to be placed continuously.");
 
 #pragma pack(push, 1)
-struct InputParams {
-  StepInput step_input[kLstmTimestep];
-};
-
 struct CellParams {
-  CellRuntime cell_runtime[kCellNumber];
+  CellState cell_state_h[kCellNumber + 1][kLstmTimestep + 1];
+  CellState cell_state_c[kCellNumber];
+  CellTemp gemvw_temp[kCellNumber];
+  CellTemp gemvu_temp[kCellNumber];
 };
 #pragma pack(pop)
 } // namespace lstm
 
 using namespace lstm;
 
-#pragma pack(push, 1)
-struct GemvwParams {
-  CUdeviceptr d_input;
-  CUdeviceptr d_model;
-  CUdeviceptr d_runtime;
-  int gate_num;
-};
-
-struct GemvuParams {
-  CUdeviceptr d_model;
-  CUdeviceptr d_runtime;
-  int gate_num;
-};
-
-struct SolveParams {
-  CUdeviceptr d_output;
-  CUdeviceptr d_model;
-  CUdeviceptr d_runtime;
-};
-#pragma pack(pop)
-
-class NaiveLSTMCell {
+class Wave {
 public:
-  NaiveLSTMCell();
-  void CountDeviceptr(CUdeviceptr d_input_params, CUdeviceptr d_model_params);
-  void InitCellParams();
-  void Compute(int step_idx, int cell_idx);
+  explicit Wave();
+  void InitCellParams(CUdeviceptr d_cell_params);
+  void Compute(CUdeviceptr d_model_params, CUdeviceptr d_cell_params,
+               int step_idx, int cell_idx, int wave_size);
   void Finalize();
 
 private:
   CUdevice cu_device_;
   CUcontext cu_context_;
-  CUfunction cu_gemvw_;
-  CUfunction cu_gemvu_;
   CUfunction cu_solve_;
-  CUdeviceptr d_cell_params_;
-  CUdeviceptr d_cell_model_[kCellNumber];
-  CUdeviceptr d_step_input_[kLstmTimestep];
-  CUdeviceptr d_cell_runtime_[kCellNumber];
 };
 
-class NaiveLSTM {
+class WavefrontLSTM {
 public:
-  explicit NaiveLSTM(absl::Span<const float> src_model);
+  explicit WavefrontLSTM(absl::Span<const float> src_model);
   bool Initialize(absl::Span<const float> input);
   void Solve();
   bool Fetch(absl::Span<float> output);
   void Finalize();
 
 private:
-  NaiveLSTMCell cell_;
+  Wave wave_;
   CUdeviceptr d_model_params_;
-  CUdeviceptr d_input_params_;
+  CUdeviceptr d_cell_params_;
+  CUdeviceptr d_input_;
+  CUdeviceptr d_output_;
 };
 
-__global__ void gemvw(StepInput *d_input, CellModel *d_model,
-                      CellRuntime *d_runtime, int gate_num);
-__global__ void gemvu(CellModel *d_model, CellRuntime *d_runtime, int gate_num);
-__global__ void solve(StepInput *d_output, CellModel *d_model,
-                      CellRuntime *d_runtime);
+__global__ void gemv(CellState *d_input, CellTemp *d_temp,
+                     float weights[kLstmGateNumber][kInputSize][kHiddenSize],
+                     const int gate_num);
+__global__ void solve(CellState *d_output, CellState *d_state_c,
+                      CellTemp *d_gevmw_temp, CellTemp *d_gevmu_temp,
+                      CellModel *d_model);
 
 std::vector<float> ReadFloatFromFile(const std::string &path) {
   std::ifstream in_file(path);
@@ -166,13 +133,13 @@ std::vector<float> ReadFloatFromFile(const std::string &path) {
                             std::istream_iterator<float>());
 }
 
-TEST(TestLSTM, test_naive_lstm) {
+TEST(TestLSTM, test_wavefront_lstm) {
   auto model = ReadFloatFromFile("model_params.txt");
   auto input = ReadFloatFromFile("input_params.txt");
   auto expect_result = ReadFloatFromFile("expect_results.txt");
   std::vector<float> output_result_buffer(expect_result.size());
   absl::Span<float> output(output_result_buffer);
-  auto network = new NaiveLSTM(model);
+  auto network = new WavefrontLSTM(model);
 
   ASSERT_TRUE(network->Initialize(input));
   network->Solve();
@@ -204,124 +171,149 @@ TEST(TestLSTM, test_naive_lstm) {
     max_ms = std::max(iteration_ms, max_ms);
     total_ms = total_ms + iteration_ms;
   }
-  printf("Sumamry: [min, max, mean] = [%f, %f, %f] us\n", min_ms, max_ms,
-         total_ms / kLoop);
+  printf("Summary: [min, max, mean] = [%f, %f, %f] ms\n", min_ms / 1000.0,
+         max_ms / 1000.0, total_ms / kLoop / 1000.0);
 
   network->Finalize();
 }
 
-NaiveLSTMCell::NaiveLSTMCell() {
+Wave::Wave() {
   CU_CHECK(cuInit(0));
   CU_CHECK(cuDeviceGet(&cu_device_, 0));
   CU_CHECK(cuCtxCreate(&cu_context_, 0, cu_device_));
-  CUDA_CHECK(cudaGetFuncBySymbol(&cu_gemvw_, (const void *)gemvw));
-  CUDA_CHECK(cudaGetFuncBySymbol(&cu_gemvu_, (const void *)gemvu));
   CUDA_CHECK(cudaGetFuncBySymbol(&cu_solve_, (const void *)solve));
-  CU_CHECK(cuMemAlloc(&d_cell_params_, sizeof(CellParams)));
 }
 
-void NaiveLSTMCell::Finalize() {
-  CU_CHECK(cuMemFree(d_cell_params_));
-  CU_CHECK(cuCtxDestroy(cu_context_));
+void Wave::Finalize() { CU_CHECK(cuCtxDestroy(cu_context_)); }
+
+struct SolveParams {
+  CellState *d_model_params;
+  CellState *d_cell_params;
+  CellTemp *d_model_params1;
+  CellTemp *d_cell_params1;
+  CellModel *d_model_params2;
+};
+void Wave::Compute(CUdeviceptr d_model_params, CUdeviceptr d_cell_params,
+                   int step_idx, int cell_idx, int wave_size) {
+  int wave_idx = 0;
+  CellState *d_input_w =
+      &((CellParams *)d_cell_params)
+           ->cell_state_h[cell_idx + wave_idx - 1][step_idx - wave_idx];
+  CellTemp *d_gemvw_temp =
+      &((CellParams *)d_cell_params)->gemvw_temp[cell_idx + wave_idx - 1];
+  CellModel *d_model =
+      &((ModelParams *)d_model_params)->cell_model[cell_idx + wave_idx - 1];
+
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                                      d_model->weights_w, 0);
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                                      d_model->weights_w, 1);
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                                      d_model->weights_w, 2);
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                                      d_model->weights_w, 3);
+
+  CellState *d_input_u =
+      &((CellParams *)d_cell_params)
+           ->cell_state_h[cell_idx + wave_idx][step_idx - wave_idx - 1];
+  CellTemp *d_gemvu_temp =
+      &((CellParams *)d_cell_params)->gemvu_temp[cell_idx + wave_idx - 1];
+
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                                      d_model->weights_u, 0);
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                                      d_model->weights_u, 1);
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                                      d_model->weights_u, 2);
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                                      d_model->weights_u, 3);
+
+  CellState *d_output =
+      &((CellParams *)d_cell_params)
+           ->cell_state_h[cell_idx + wave_idx][step_idx - wave_idx];
+  CellState *d_state_c =
+      &((CellParams *)d_cell_params)->cell_state_c[cell_idx + wave_idx - 1];
+  solve<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(
+      d_output, d_state_c, d_gemvw_temp, d_gemvu_temp, d_model);
 }
 
-void NaiveLSTMCell::CountDeviceptr(CUdeviceptr d_input_params,
-                                   CUdeviceptr d_model_params) {
-  d_cell_runtime_[0] = d_cell_params_;
-  for (int i = 1; i < kCellNumber; ++i) {
-    d_cell_runtime_[i] = d_cell_runtime_[i - 1] + sizeof(CellRuntime);
-  }
-
-  d_step_input_[0] = d_input_params;
-  for (int i = 1; i < kLstmTimestep; ++i) {
-    d_step_input_[i] = d_step_input_[i - 1] + sizeof(StepInput);
-  }
-
-  d_cell_model_[0] = d_model_params;
-  for (int i = 1; i < kCellNumber; ++i) {
-    d_cell_model_[i] = d_cell_model_[i - 1] + sizeof(CellModel);
-  }
+void Wave::InitCellParams(CUdeviceptr d_cell_params) {
+  CU_CHECK(cuMemsetD32(
+      d_cell_params, 0.000000e+00f,
+      (sizeof(CellParams::cell_state_h) + sizeof(CellParams::cell_state_c)) /
+          sizeof(float)));
 }
 
-void NaiveLSTMCell::Compute(int step_idx, int cell_idx) {
-  for (int i = 0; i < kLstmGateNumber; ++i) {
-    GemvwParams gemvw_params = {d_step_input_[step_idx],
-                                d_cell_model_[cell_idx],
-                                d_cell_runtime_[cell_idx], i};
-    CU_CHECK(LaunchKernel(cu_gemvw_, kGemvBlockNumber, kHiddenSize, 0,
-                          gemvw_params));
-  }
-
-  for (int i = 0; i < kLstmGateNumber; ++i) {
-    GemvuParams gemvu_params = {d_cell_model_[cell_idx],
-                                d_cell_runtime_[cell_idx], i};
-    CU_CHECK(LaunchKernel(cu_gemvu_, kGemvBlockNumber, kHiddenSize, 0,
-                          gemvu_params));
-  }
-
-  SolveParams solve_params = {d_step_input_[step_idx], d_cell_model_[cell_idx],
-                              d_cell_runtime_[cell_idx]};
-  CU_CHECK(LaunchKernel(cu_solve_, 1, kHiddenSize, 0, solve_params));
-}
-
-void NaiveLSTMCell::InitCellParams() {
-  CU_CHECK(cuMemsetD32(d_cell_params_, 0.000000e+00f,
-                       sizeof(CellParams) / sizeof(float)));
-}
-
-NaiveLSTM::NaiveLSTM(absl::Span<const float> src_model) {
-  CU_CHECK(cuMemAlloc(&d_input_params_, sizeof(InputParams)));
+WavefrontLSTM::WavefrontLSTM(absl::Span<const float> src_model) {
   CU_CHECK(cuMemAlloc(&d_model_params_, sizeof(ModelParams)));
+  CU_CHECK(cuMemAlloc(&d_cell_params_, sizeof(CellParams)));
   CU_CHECK(
       cuMemcpyHtoD(d_model_params_, src_model.data(), sizeof(ModelParams)));
-  cell_.CountDeviceptr(d_input_params_, d_model_params_);
+
+  d_input_ = d_cell_params_ + sizeof(CellState);
+  d_output_ = d_cell_params_ + sizeof(CellParams::cell_state_h) -
+              kLstmTimestep * sizeof(CellState);
 }
 
-bool NaiveLSTM::Initialize(absl::Span<const float> input) {
-  if (input.size() != sizeof(InputParams) / sizeof(float)) {
+bool WavefrontLSTM::Initialize(absl::Span<const float> input) {
+  if (input.size() != sizeof(CellState) * kLstmTimestep / sizeof(float)) {
     return false;
   }
 
-  CU_CHECK(cuMemcpyHtoD(d_input_params_, input.data(), sizeof(InputParams)));
-  cell_.InitCellParams();
+  wave_.InitCellParams(d_cell_params_);
+  CU_CHECK(
+      cuMemcpyHtoD(d_input_, input.data(), sizeof(CellState) * kLstmTimestep));
   return true;
 }
 
-void NaiveLSTM::Solve() {
+void WavefrontLSTM::Solve() {
   for (int i = 0; i < kLstmTimestep; ++i) {
     for (int j = 0; j < kCellNumber; ++j) {
-      cell_.Compute(i, j);
+      wave_.Compute(d_model_params_, d_cell_params_, i + 1, j + 1, 1);
     }
   }
 }
 
-bool NaiveLSTM::Fetch(absl::Span<float> output) {
-  if (output.size() != sizeof(InputParams) / sizeof(float)) {
+bool WavefrontLSTM::Fetch(absl::Span<float> output) {
+  if (output.size() != sizeof(CellState) * kLstmTimestep / sizeof(float)) {
     return false;
   }
 
-  CU_CHECK(cuMemcpyDtoH(output.data(), d_input_params_, sizeof(InputParams)));
+  CU_CHECK(cuMemcpyDtoH(output.data(), d_output_,
+                        sizeof(CellState) * kLstmTimestep));
   return true;
 }
 
-void NaiveLSTM::Finalize() {
+void WavefrontLSTM::Finalize() {
   CU_CHECK(cuMemFree(d_model_params_));
-  CU_CHECK(cuMemFree(d_input_params_));
-  cell_.Finalize();
+  CU_CHECK(cuMemFree(d_cell_params_));
+  wave_.Finalize();
 }
 
 __device__ static inline float sigmoid(float x) {
   return 1.000000e+00f / (1.000000e+00f + __expf(0.000000e+00f - x));
 }
 
-__global__ void gemvw(StepInput *d_input, CellModel *d_model,
-                      CellRuntime *d_runtime, int gate_num) {
+__global__ void gemv(CellState *d_input1, CellTemp *d_temp1,
+                     float weights1[kLstmGateNumber][kInputSize][kHiddenSize],
+                     const int gate_num) {
+
   const int warp_idx = threadIdx.x / kThreadsPerWarp;
   const int lane_idx = threadIdx.x % kThreadsPerWarp;
-  const int col_idx = blockIdx.x * kColumnsPerBlock + lane_idx;
+  const int col_idx =
+      (blockIdx.x % kGemvBlockNumber) * kColumnsPerBlock + lane_idx;
+
+  const int wave_idx = blockIdx.x / kGemvBlockNumber;
+  CellState *d_input = d_input1 + wave_idx * (kLstmTimestep + 1) - wave_idx;
+  CellTemp *d_temp = d_temp1 + wave_idx;
+
+  float *weights2 =
+      (float *)weights1 + wave_idx * sizeof(CellModel) / sizeof(float);
+  float(*weights)[kInputSize][kHiddenSize] =
+      (float(*)[kInputSize][kHiddenSize])(weights2);
 
   if (warp_idx == 0) {
-    d_runtime->gemvw_temp[gate_num][col_idx] = 0.000000e+00f;
+    d_temp->data[gate_num][col_idx] = 0.000000e+00f;
   }
   __syncthreads();
 
@@ -330,59 +322,46 @@ __global__ void gemvw(StepInput *d_input, CellModel *d_model,
   const int row_end_idx = row_start_idx + kRowsPerWarp;
   for (int row_idx = row_start_idx; row_idx < row_end_idx; ++row_idx) {
     float input_data = d_input->data[row_idx];
-    temp =
-        fma(d_model->weights_w[gate_num][row_idx][col_idx], input_data, temp);
+    temp = fma(weights[gate_num][row_idx][col_idx], input_data, temp);
   }
 
-  atomicAdd(&d_runtime->gemvw_temp[gate_num][col_idx], temp);
+  atomicAdd(&d_temp->data[gate_num][col_idx], temp);
 }
 
-__global__ void gemvu(CellModel *d_model, CellRuntime *d_runtime,
-                      int gate_num) {
+__global__ void solve(CellState *d_output1, CellState *d_state_c1,
+                      CellTemp *d_gevmw_temp1, CellTemp *d_gevmu_temp1,
+                      CellModel *d_model1) {
   const int warp_idx = threadIdx.x / kThreadsPerWarp;
   const int lane_idx = threadIdx.x % kThreadsPerWarp;
-  const int col_idx = blockIdx.x * kColumnsPerBlock + lane_idx;
+  const int col_idx =
+      (blockIdx.x % kGemvBlockNumber) * kColumnsPerBlock + lane_idx;
+
+  const int wave_idx = blockIdx.x / kGemvBlockNumber;
+  CellState *d_output = d_output1 + wave_idx * (kLstmTimestep + 1) - wave_idx;
+  CellState *d_state_c = d_state_c1 + wave_idx;
+  CellTemp *d_gevmw_temp = d_gevmw_temp1 + wave_idx;
+  CellTemp *d_gevmu_temp = d_gevmu_temp1 + wave_idx;
+  CellModel *d_model = d_model1 + wave_idx;
 
   if (warp_idx == 0) {
-    d_runtime->gemvu_temp[gate_num][col_idx] = 0.000000e+00f;
+    float input_gate_x = d_gevmw_temp->data[0][col_idx] +
+                         d_gevmu_temp->data[0][col_idx] +
+                         d_model->bias[0][col_idx];
+    float input_gate_y = d_gevmw_temp->data[1][col_idx] +
+                         d_gevmu_temp->data[1][col_idx] +
+                         d_model->bias[1][col_idx];
+    float forget_gate = d_gevmw_temp->data[2][col_idx] +
+                        d_gevmu_temp->data[2][col_idx] +
+                        d_model->bias[2][col_idx];
+    float output_gate = d_gevmw_temp->data[3][col_idx] +
+                        d_gevmu_temp->data[3][col_idx] +
+                        d_model->bias[3][col_idx];
+    input_gate_x = sigmoid(input_gate_x);
+    input_gate_y = tanh(input_gate_y);
+    output_gate = sigmoid(output_gate);
+    forget_gate =
+        sigmoid(forget_gate + 1.000000e+00f) * d_state_c->data[col_idx];
+    d_state_c->data[col_idx] = fma(input_gate_x, input_gate_y, forget_gate);
+    d_output->data[col_idx] = (tanh(d_state_c->data[col_idx])) * output_gate;
   }
-  __syncthreads();
-
-  float temp = 0.000000e+00f;
-  const int row_start_idx = kRowsPerWarp * warp_idx;
-  const int row_end_idx = row_start_idx + kRowsPerWarp;
-  for (int row_idx = row_start_idx; row_idx < row_end_idx; ++row_idx) {
-    float state_h_data = d_runtime->state_h[row_idx];
-    temp =
-        fma(d_model->weights_u[gate_num][row_idx][col_idx], state_h_data, temp);
-  }
-
-  atomicAdd(&d_runtime->gemvu_temp[gate_num][col_idx], temp);
-}
-
-__global__ void solve(StepInput *d_output, CellModel *d_model,
-                      CellRuntime *d_runtime) {
-  const int col_idx = threadIdx.x;
-
-  float input_gate_x = d_runtime->gemvw_temp[0][col_idx] +
-                       d_runtime->gemvu_temp[0][col_idx] +
-                       d_model->bias[0][col_idx];
-  float input_gate_y = d_runtime->gemvw_temp[1][col_idx] +
-                       d_runtime->gemvu_temp[1][col_idx] +
-                       d_model->bias[1][col_idx];
-  float forget_gate = d_runtime->gemvw_temp[2][col_idx] +
-                      d_runtime->gemvu_temp[2][col_idx] +
-                      d_model->bias[2][col_idx];
-  float output_gate = d_runtime->gemvw_temp[3][col_idx] +
-                      d_runtime->gemvu_temp[3][col_idx] +
-                      d_model->bias[3][col_idx];
-  input_gate_x = sigmoid(input_gate_x);
-  input_gate_y = tanh(input_gate_y);
-  output_gate = sigmoid(output_gate);
-  forget_gate =
-      sigmoid(forget_gate + 1.000000e+00f) * d_runtime->state_c[col_idx];
-  d_runtime->state_c[col_idx] = fma(input_gate_x, input_gate_y, forget_gate);
-  d_runtime->state_h[col_idx] =
-      (tanh(d_runtime->state_c[col_idx])) * output_gate;
-  d_output->data[col_idx] = d_runtime->state_h[col_idx];
 }

@@ -81,8 +81,10 @@ struct CellParams {
   CellState decoder_state_h[(kDecoderTimestep + 1) * kDecoderCellNumber];
   CellState encoder_state_c[kEncoderCellNumber];
   CellState decoder_state_c[kDecoderCellNumber];
-  CellTemp encoder_temp[kEncoderCellNumber];
-  CellTemp decoder_temp[kDecoderCellNumber];
+  CellTemp encoder_gemvw_temp[kEncoderCellNumber];
+  CellTemp encoder_gemvu_temp[kEncoderCellNumber];
+  CellTemp decoder_gemvw_temp[kDecoderCellNumber];
+  CellTemp decoder_gemvu_temp[kDecoderCellNumber];
 };
 #pragma pack(pop)
 } // namespace seq2seq
@@ -107,16 +109,14 @@ class Seq2seqWave {
 public:
   Seq2seqWave();
   void InitCellParams(CUdeviceptr d_cell_params);
-  void EncoderCompute(int wave_size, KernelParams kernel_params);
+  void EncoderCompute(CUdeviceptr d_model_params, CUdeviceptr d_cell_params,
+                      int step_idx, int cell_idx, int wave_size);
   void DecoderCompute(KernelParams kernel_params);
   void Finalize();
 
 private:
   CUdevice cu_device_;
   CUcontext cu_context_;
-  CUfunction cu_wave_encoder_;
-  CUfunction cu_decoder_;
-  CUfunction cu_decoder_layer0_step0_;
 };
 
 class Seq2seq {
@@ -135,14 +135,12 @@ private:
   CUdeviceptr d_output_;
 };
 
-__global__ void seq2seq_encoder(ModelParams *d_model_params,
-                                CellParams *d_cell_params, int step_idx,
-                                int cell_idx);
-__global__ void seq2seq_decoder(ModelParams *d_model_params,
-                                CellParams *d_cell_params, int cell_idx,
-                                int step_idx);
-__global__ void seq2seq_decoder_layer0_step0(ModelParams *d_model_params,
-                                             CellParams *d_cell_params);
+__global__ void gemv(CellState *d_input, CellTemp *d_temp,
+                     float weights[kLstmGateNumber][kInputSize][kHiddenSize],
+                     const int gate_num);
+__global__ void solve(CellState *d_output, CellState *d_state_c,
+                      CellTemp *d_gevmw_temp, CellTemp *d_gevmu_temp,
+                      CellModel *d_model);
 
 std::vector<float> ReadFloatFromFile(const std::string &path) {
   std::ifstream in_file(path);
@@ -197,33 +195,123 @@ Seq2seqWave::Seq2seqWave() {
   CU_CHECK(cuInit(0));
   CU_CHECK(cuDeviceGet(&cu_device_, 0));
   CU_CHECK(cuCtxCreate(&cu_context_, 0, cu_device_));
-  CUDA_CHECK(
-      cudaGetFuncBySymbol(&cu_wave_encoder_, (const void *)seq2seq_encoder));
-  CUDA_CHECK(cudaGetFuncBySymbol(&cu_decoder_, (const void *)seq2seq_decoder));
-  CUDA_CHECK(cudaGetFuncBySymbol(&cu_decoder_layer0_step0_,
-                                 (const void *)seq2seq_decoder_layer0_step0));
 }
 
 void Seq2seqWave::Finalize() { CU_CHECK(cuCtxDestroy(cu_context_)); }
 
-void Seq2seqWave::EncoderCompute(int wave_size, KernelParams kernel_params) {
-  for (int wave_idx = 0; wave_idx < wave_size; ++wave_idx) {
-    CU_CHECK(LaunchKernel(cu_wave_encoder_, kGemvBlockNumber, kHiddenSize, 0,
-                          kernel_params));
-    kernel_params.step_idx--;
-    kernel_params.cell_idx++;
-  }
+void Seq2seqWave::EncoderCompute(CUdeviceptr d_model_params,
+                                 CUdeviceptr d_cell_params, int step_idx,
+                                 int cell_idx, int wave_size) {
+  int wave_idx = 0;
+  CellState *d_input_w =
+      &((CellParams *)d_cell_params)
+           ->encoder_state_h[cell_idx + wave_idx - 1][step_idx - wave_idx];
+  CellTemp *d_gemvw_temp = &((CellParams *)d_cell_params)
+                                ->encoder_gemvw_temp[cell_idx + wave_idx - 1];
+  CellModel *d_model =
+      &((ModelParams *)d_model_params)->encoder_model[cell_idx + wave_idx - 1];
+
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                                      d_model->weights_w, 0);
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                                      d_model->weights_w, 1);
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                                      d_model->weights_w, 2);
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                                      d_model->weights_w, 3);
+
+  CellState *d_input_u =
+      &((CellParams *)d_cell_params)
+           ->encoder_state_h[cell_idx + wave_idx][step_idx - wave_idx - 1];
+  CellTemp *d_gemvu_temp = &((CellParams *)d_cell_params)
+                                ->encoder_gemvu_temp[cell_idx + wave_idx - 1];
+
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                                      d_model->weights_u, 0);
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                                      d_model->weights_u, 1);
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                                      d_model->weights_u, 2);
+  gemv<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                                      d_model->weights_u, 3);
+
+  CellState *d_output =
+      &((CellParams *)d_cell_params)
+           ->encoder_state_h[cell_idx + wave_idx][step_idx - wave_idx];
+  CellState *d_state_c =
+      &((CellParams *)d_cell_params)->encoder_state_c[cell_idx + wave_idx - 1];
+  solve<<<kGemvBlockNumber * wave_size, kHiddenSize>>>(
+      d_output, d_state_c, d_gemvw_temp, d_gemvu_temp, d_model);
 }
 
 void Seq2seqWave::DecoderCompute(KernelParams kernel_params) {
-  if (kernel_params.step_idx == 0 && kernel_params.cell_idx == 0) {
-    KernelParams0 kernel_params0 = {kernel_params.d_model_params,
-                                    kernel_params.d_cell_params};
-    CU_CHECK(LaunchKernel(cu_decoder_layer0_step0_, kGemvBlockNumber,
-                          kHiddenSize, 0, kernel_params0));
+  ModelParams *d_model_params = (ModelParams *)kernel_params.d_model_params;
+  CellParams *d_cell_params = (CellParams *)kernel_params.d_cell_params;
+  const int step_idx = kernel_params.step_idx;
+  const int cell_idx = kernel_params.cell_idx;
+  if (step_idx == 0 && cell_idx == 0) {
+    CellState *d_input_w =
+        &d_cell_params->encoder_state_c[kEncoderCellNumber - 1];
+    CellTemp *d_gemvw_temp = &d_cell_params->decoder_gemvw_temp[0];
+    CellModel *d_model = &d_model_params->decoder_model[0];
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                            d_model->weights_w, 0);
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                            d_model->weights_w, 1);
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                            d_model->weights_w, 2);
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                            d_model->weights_w, 3);
+
+    CellState *d_input_u = &d_cell_params->decoder_state_h[0];
+    CellTemp *d_gemvu_temp = &d_cell_params->decoder_gemvu_temp[0];
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                            d_model->weights_u, 0);
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                            d_model->weights_u, 1);
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                            d_model->weights_u, 2);
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                            d_model->weights_u, 3);
+
+    CellState *d_output = &d_cell_params->decoder_state_h[kDecoderCellNumber];
+    CellState *d_state_c = &d_cell_params->decoder_state_c[0];
+    solve<<<kGemvBlockNumber, kHiddenSize>>>(d_output, d_state_c, d_gemvw_temp,
+                                             d_gemvu_temp, d_model);
   } else {
-    CU_CHECK(LaunchKernel(cu_decoder_, kGemvBlockNumber, kHiddenSize, 0,
-                          kernel_params));
+    CellState *d_input_w =
+        &d_cell_params->decoder_state_h[step_idx * kDecoderCellNumber +
+                                        (cell_idx - 1) - 1];
+    CellTemp *d_gemvw_temp = &d_cell_params->decoder_gemvw_temp[cell_idx - 1];
+    CellModel *d_model = &d_model_params->decoder_model[cell_idx - 1];
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                            d_model->weights_w, 0);
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                            d_model->weights_w, 1);
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                            d_model->weights_w, 2);
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_w, d_gemvw_temp,
+                                            d_model->weights_w, 3);
+
+    CellState *d_input_u =
+        &d_cell_params->decoder_state_h[(step_idx - 1) * kDecoderCellNumber +
+                                        cell_idx - 1];
+    CellTemp *d_gemvu_temp = &d_cell_params->decoder_gemvu_temp[cell_idx - 1];
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                            d_model->weights_u, 0);
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                            d_model->weights_u, 1);
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                            d_model->weights_u, 2);
+    gemv<<<kGemvBlockNumber, kHiddenSize>>>(d_input_u, d_gemvu_temp,
+                                            d_model->weights_u, 3);
+
+    CellState *d_output =
+        &d_cell_params
+             ->decoder_state_h[step_idx * kDecoderCellNumber + cell_idx - 1];
+    CellState *d_state_c = &d_cell_params->decoder_state_c[cell_idx - 1];
+    solve<<<kGemvBlockNumber, kHiddenSize>>>(d_output, d_state_c, d_gemvw_temp,
+                                             d_gemvu_temp, d_model);
   }
 }
 
@@ -258,20 +346,10 @@ bool Seq2seq::Initialize(absl::Span<const float> input) {
 void Seq2seq::Solve() {
   const int max_wave_size = std::min(kEncoderCellNumber, kEncoderTimestep);
   const int max_wave_number = kEncoderCellNumber + kEncoderTimestep - 1;
-  for (int wave_idx = 1; wave_idx <= max_wave_number; ++wave_idx) {
-    int wave_size =
-        (wave_idx < std::max(kEncoderCellNumber, kEncoderTimestep))
-            ? std::min(wave_idx, max_wave_size)
-            : (max_wave_size -
-               (wave_idx - std::max(kEncoderCellNumber, kEncoderTimestep)));
-    int step_start_num =
-        (wave_idx < kEncoderTimestep) ? wave_idx : kEncoderTimestep;
-    int layer_start_num =
-        (wave_idx < kEncoderTimestep) ? 1 : (wave_idx - kEncoderTimestep + 1);
-
-    KernelParams kernel_params = {d_model_params_, d_cell_params_,
-                                  step_start_num, layer_start_num};
-    wave_.EncoderCompute(wave_size, kernel_params);
+  for (int i = 0; i < kEncoderTimestep; ++i) {
+    for (int j = 0; j < kEncoderCellNumber; ++j) {
+      wave_.EncoderCompute(d_model_params_, d_cell_params_, i + 1, j + 1, 1);
+    }
   }
 
   for (int step_idx = 1; step_idx <= kDecoderTimestep; ++step_idx) {
@@ -303,104 +381,75 @@ __device__ static inline float sigmoid(float x) {
   return 1.000000e+00f / (1.000000e+00f + __expf(0.000000e+00f - x));
 }
 
-__device__ static inline void
-seq2seq_compute(CellState *d_input, CellState *d_input_state_h,
-                CellState *d_output_state_h, CellState *d_state_c,
-                CellTemp *d_temp, CellModel *d_model) {
+__global__ void gemv(CellState *d_input1, CellTemp *d_temp1,
+                     float weights1[kLstmGateNumber][kInputSize][kHiddenSize],
+                     const int gate_num) {
+
   const int warp_idx = threadIdx.x / kThreadsPerWarp;
   const int lane_idx = threadIdx.x % kThreadsPerWarp;
   const int col_idx =
       (blockIdx.x % kGemvBlockNumber) * kColumnsPerBlock + lane_idx;
 
+  const int wave_idx = blockIdx.x / kGemvBlockNumber;
+  CellState *d_input = d_input1 + wave_idx * (kEncoderTimestep + 1) - wave_idx;
+  CellTemp *d_temp = d_temp1 + wave_idx;
+
+  float *weights2 =
+      (float *)weights1 + wave_idx * sizeof(CellModel) / sizeof(float);
+  float(*weights)[kInputSize][kHiddenSize] =
+      (float(*)[kInputSize][kHiddenSize])(weights2);
+
   if (warp_idx == 0) {
-    for (int i = 0; i < kLstmGateNumber; ++i) {
-      d_temp->data[i][col_idx] = 0.000000e+00f;
-    }
+    d_temp->data[gate_num][col_idx] = 0.000000e+00f;
   }
   __syncthreads();
 
-  float temp[kLstmGateNumber] = {0.000000e+00f, 0.000000e+00f, 0.000000e+00f,
-                                 0.000000e+00f};
+  float temp = 0.000000e+00f;
   const int row_start_idx = kRowsPerWarp * warp_idx;
   const int row_end_idx = row_start_idx + kRowsPerWarp;
   for (int row_idx = row_start_idx; row_idx < row_end_idx; ++row_idx) {
     float input_data = d_input->data[row_idx];
-    float state_h_data = d_input_state_h->data[row_idx];
-    for (int i = 0; i < kLstmGateNumber; ++i) {
-      temp[i] =
-          fma(d_model->weights_w[i][row_idx][col_idx], input_data, temp[i]);
-    }
-    for (int i = 0; i < kLstmGateNumber; ++i) {
-      temp[i] =
-          fma(d_model->weights_u[i][row_idx][col_idx], state_h_data, temp[i]);
-    }
+    temp = fma(weights[gate_num][row_idx][col_idx], input_data, temp);
   }
 
-  for (int i = 0; i < kLstmGateNumber; ++i) {
-    atomicAdd(&d_temp->data[i][col_idx], temp[i]);
-  }
-  __syncthreads();
+  atomicAdd(&d_temp->data[gate_num][col_idx], temp);
+}
+
+__global__ void solve(CellState *d_output1, CellState *d_state_c1,
+                      CellTemp *d_gevmw_temp1, CellTemp *d_gevmu_temp1,
+                      CellModel *d_model1) {
+  const int warp_idx = threadIdx.x / kThreadsPerWarp;
+  const int lane_idx = threadIdx.x % kThreadsPerWarp;
+  const int col_idx =
+      (blockIdx.x % kGemvBlockNumber) * kColumnsPerBlock + lane_idx;
+
+  const int wave_idx = blockIdx.x / kGemvBlockNumber;
+  CellState *d_output =
+      d_output1 + wave_idx * (kEncoderTimestep + 1) - wave_idx;
+  CellState *d_state_c = d_state_c1 + wave_idx;
+  CellTemp *d_gevmw_temp = d_gevmw_temp1 + wave_idx;
+  CellTemp *d_gevmu_temp = d_gevmu_temp1 + wave_idx;
+  CellModel *d_model = d_model1 + wave_idx;
 
   if (warp_idx == 0) {
-    float input_gate_x = d_temp->data[0][col_idx] + d_model->bias[0][col_idx];
-    float input_gate_y = d_temp->data[1][col_idx] + d_model->bias[1][col_idx];
-    float forget_gate = d_temp->data[2][col_idx] + d_model->bias[2][col_idx];
-    float output_gate = d_temp->data[3][col_idx] + d_model->bias[3][col_idx];
+    float input_gate_x = d_gevmw_temp->data[0][col_idx] +
+                         d_gevmu_temp->data[0][col_idx] +
+                         d_model->bias[0][col_idx];
+    float input_gate_y = d_gevmw_temp->data[1][col_idx] +
+                         d_gevmu_temp->data[1][col_idx] +
+                         d_model->bias[1][col_idx];
+    float forget_gate = d_gevmw_temp->data[2][col_idx] +
+                        d_gevmu_temp->data[2][col_idx] +
+                        d_model->bias[2][col_idx];
+    float output_gate = d_gevmw_temp->data[3][col_idx] +
+                        d_gevmu_temp->data[3][col_idx] +
+                        d_model->bias[3][col_idx];
     input_gate_x = sigmoid(input_gate_x);
     input_gate_y = tanh(input_gate_y);
     output_gate = sigmoid(output_gate);
     forget_gate =
         sigmoid(forget_gate + 1.000000e+00f) * d_state_c->data[col_idx];
     d_state_c->data[col_idx] = fma(input_gate_x, input_gate_y, forget_gate);
-    d_output_state_h->data[col_idx] =
-        (tanh(d_state_c->data[col_idx])) * output_gate;
+    d_output->data[col_idx] = (tanh(d_state_c->data[col_idx])) * output_gate;
   }
-}
-
-__global__ void __launch_bounds__(128, 4)
-    seq2seq_encoder(ModelParams *d_model_params, CellParams *d_cell_params,
-                    int step_idx, int cell_idx) {
-  CellState *d_input = &d_cell_params->encoder_state_h[cell_idx - 1][step_idx];
-  CellState *d_input_state_h =
-      &d_cell_params->encoder_state_h[cell_idx][step_idx - 1];
-  CellState *d_output_state_h =
-      &d_cell_params->encoder_state_h[cell_idx][step_idx];
-  CellState *d_state_c = &d_cell_params->encoder_state_c[cell_idx - 1];
-  CellTemp *d_temp = &d_cell_params->encoder_temp[cell_idx - 1];
-  CellModel *d_model = &d_model_params->encoder_model[cell_idx - 1];
-  seq2seq_compute(d_input, d_input_state_h, d_output_state_h, d_state_c, d_temp,
-                  d_model);
-}
-
-__global__ void __launch_bounds__(128, 4)
-    seq2seq_decoder(ModelParams *d_model_params, CellParams *d_cell_params,
-                    int step_idx, int cell_idx) {
-  CellState *d_input =
-      &d_cell_params->decoder_state_h[step_idx * kDecoderCellNumber +
-                                      (cell_idx - 1) - 1];
-  CellState *d_input_state_h =
-      &d_cell_params->decoder_state_h[(step_idx - 1) * kDecoderCellNumber +
-                                      cell_idx - 1];
-  CellState *d_output_state_h =
-      &d_cell_params
-           ->decoder_state_h[step_idx * kDecoderCellNumber + cell_idx - 1];
-  CellState *d_state_c = &d_cell_params->decoder_state_c[cell_idx - 1];
-  CellTemp *d_temp = &d_cell_params->decoder_temp[cell_idx - 1];
-  CellModel *d_model = &d_model_params->decoder_model[cell_idx - 1];
-  seq2seq_compute(d_input, d_input_state_h, d_output_state_h, d_state_c, d_temp,
-                  d_model);
-}
-
-__global__ void __launch_bounds__(128, 4)
-    seq2seq_decoder_layer0_step0(ModelParams *d_model_params,
-                                 CellParams *d_cell_params) {
-  CellState *d_input = &d_cell_params->encoder_state_c[kEncoderCellNumber - 1];
-  CellState *d_input_state_h = &d_cell_params->decoder_state_h[0];
-  CellState *d_output_state_h =
-      &d_cell_params->decoder_state_h[kDecoderCellNumber];
-  CellState *d_state_c = &d_cell_params->decoder_state_c[0];
-  CellTemp *d_temp = &d_cell_params->decoder_temp[0];
-  CellModel *d_model = &d_model_params->decoder_model[0];
-  seq2seq_compute(d_input, d_input_state_h, d_output_state_h, d_state_c, d_temp,
-                  d_model);
 }
