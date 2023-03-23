@@ -198,9 +198,7 @@ private:
   CUfunction cu_gemm_k2_;
   CUfunction cu_gemm_k3_;
   CUfunction cu_add_bias_;
-  CUfunction cu_reshape_;
   CUfunction cu_softmax_;
-  CUfunction cu_transpose_;
   CUdeviceptr d_query_buf_;
   CUdeviceptr d_key_buf_;
   CUdeviceptr d_value_buf_;
@@ -255,6 +253,8 @@ __global__ void gemm_k6(const half *__restrict__ matrix_a,
 __global__ void layernorm(BertInput *out, const BertWordVec *gamma,
                           const BertWordVec *beta);
 __global__ void activate(BertInput *out);
+__global__ void k1_add_bias(BertInput *input, const BertWordVec *bias,
+                            BertInput *output);
 __global__ void add_bias(BertInput *input, const BertWordVec *bias,
                          BertInput *output);
 __global__ void add_bias_large(BertInput *input, const BertWordVec *bias,
@@ -344,16 +344,22 @@ void Attention::Initialize(AttentionParam param, int max_shm_per_block) {
           gemm_three_stage<kGemmK3WarpRowTiles, kGemmK3WarpColTiles, kHeadSize,
                            kSeqLength, kSeqLength, kGemmK3BatchedNum>));
   CUDA_CHECK(cudaGetFuncBySymbol(&cu_add_bias_, (const void *)add_bias));
-  CUDA_CHECK(
-      cudaGetFuncBySymbol(&cu_reshape_, (const void *)reshape_384768_1238464));
   CUDA_CHECK(cudaGetFuncBySymbol(&cu_softmax_, (const void *)softmax));
-  CUDA_CHECK(cudaGetFuncBySymbol(&cu_transpose_, (const void *)transpose));
   CU_CHECK(cuFuncSetAttribute(cu_gemm_k1_,
                               CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                               max_shm_per_block));
+  CUDA_CHECK(cudaFuncSetAttribute((const void *)k1_add_bias,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  max_shm_per_block));
+  CUDA_CHECK(cudaFuncSetAttribute((const void *)reshape_384768_1238464,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  max_shm_per_block));
   CU_CHECK(cuFuncSetAttribute(cu_gemm_k3_,
                               CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                               max_shm_per_block));
+  CUDA_CHECK(cudaFuncSetAttribute((const void *)transpose,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  max_shm_per_block));
 
   d_key_buf_ = d_query_buf_ + sizeof(BertInput);
   d_value_buf_ = d_key_buf_ + sizeof(BertInput);
@@ -398,22 +404,25 @@ void Attention::Solve() {
   CU_CHECK(LaunchKernel(cu_gemm_k1_, gemm_k1_blocks, kBlockThreads, 0,
                         gemm_k1_v_params, gemm_k1_shared_mem));
 
-  AddBiasParam add_q_bias_params = {
-      d_query_buf_, param_.d_self_attention.d_query_bias, d_q_bias_buf_};
-  AddBiasParam add_k_bias_params = {
-      d_key_buf_, param_.d_self_attention.d_key_bias, d_k_bias_buf_};
-  AddBiasParam add_v_bias_params = {
-      d_value_buf_, param_.d_self_attention.d_value_bias, d_v_bias_buf_};
-  CU_CHECK(LaunchKernel(cu_add_bias_, m, n / 2, 0, add_q_bias_params));
-  CU_CHECK(LaunchKernel(cu_add_bias_, m, n / 2, 0, add_k_bias_params));
-  CU_CHECK(LaunchKernel(cu_add_bias_, m, n / 2, 0, add_v_bias_params));
+  k1_add_bias<<<gemm_k1_blocks, kBlockThreads, gemm_k1_shared_mem>>>(
+      (BertInput *)d_query_buf_,
+      (BertWordVec *)param_.d_self_attention.d_query_bias,
+      (BertInput *)d_q_bias_buf_);
+  k1_add_bias<<<gemm_k1_blocks, kBlockThreads, gemm_k1_shared_mem>>>(
+      (BertInput *)d_key_buf_,
+      (BertWordVec *)param_.d_self_attention.d_key_bias,
+      (BertInput *)d_k_bias_buf_);
+  k1_add_bias<<<gemm_k1_blocks, kBlockThreads, gemm_k1_shared_mem>>>(
+      (BertInput *)d_value_buf_,
+      (BertWordVec *)param_.d_self_attention.d_value_bias,
+      (BertInput *)d_v_bias_buf_);
 
-  ReshapeParam reshape_q_params = {d_q_bias_buf_, d_q_reshape_buf_};
-  ReshapeParam reshape_k_params = {d_k_bias_buf_, d_k_reshape_buf_};
-  ReshapeParam reshape_v_params = {d_v_bias_buf_, d_v_reshape_buf_};
-  CU_CHECK(LaunchKernel(cu_reshape_, m, n / 2, 0, reshape_q_params));
-  CU_CHECK(LaunchKernel(cu_reshape_, m, n / 2, 0, reshape_k_params));
-  CU_CHECK(LaunchKernel(cu_reshape_, m, n / 2, 0, reshape_v_params));
+  reshape_384768_1238464<<<gemm_k1_blocks, kBlockThreads, gemm_k1_shared_mem>>>(
+      (BertInput *)d_q_bias_buf_, (BertInput *)d_q_reshape_buf_);
+  reshape_384768_1238464<<<gemm_k1_blocks, kBlockThreads, gemm_k1_shared_mem>>>(
+      (BertInput *)d_k_bias_buf_, (BertInput *)d_k_reshape_buf_);
+  reshape_384768_1238464<<<gemm_k1_blocks, kBlockThreads, gemm_k1_shared_mem>>>(
+      (BertInput *)d_v_bias_buf_, (BertInput *)d_v_reshape_buf_);
 
   GemmParam gemm_k2_params = {d_k_reshape_buf_, d_q_reshape_buf_, d_qk_buf_};
   const int gemm_k2_blocks =
@@ -446,11 +455,8 @@ void Attention::Solve() {
   CU_CHECK(LaunchKernel(cu_gemm_k3_, gemm_k3_blocks, kBlockThreads, 0,
                         gemm_k3_params, gemm_k3_shared_mem));
 
-  const int seq_per_block = 4;
-  ReshapeParam transpose_params = {d_transpose_dst_, param_.d_attr_out};
-  CU_CHECK(LaunchKernel(cu_transpose_,
-                        kBatchSize * kSeqLength * kHeadNum / seq_per_block,
-                        seq_per_block * kHeadSize / 2, 0, transpose_params));
+  transpose<<<gemm_k3_blocks, kBlockThreads, gemm_k3_shared_mem>>>(
+      (BertInput *)d_transpose_dst_, (BertInput *)param_.d_attr_out);
 }
 
 void Attention::Finalize() { CU_CHECK(cuMemFree(d_query_buf_)); }
@@ -763,6 +769,44 @@ __global__ void add_bias_large(BertInput *input, const BertWordVec *bias,
   }
 }
 
+__global__ void k1_add_bias(BertInput *input, const BertWordVec *bias,
+                            BertInput *output) {
+  enum {
+    kBlockRowTiles = kBlockRowWarps * kGemmK1WarpRowTiles,
+    kBlockColTiles = kBlockColWarps * kGemmK1WarpColTiles,
+    kThreads = kBlockRowWarps * kBlockColWarps * kWarpSize,
+
+    kAddBiasLanesPerRow =
+        kWmmaM * kBlockRowTiles / (sizeof(half2) / sizeof(half)),
+    kAddBiasColsPerIter = kThreads / kAddBiasLanesPerRow,
+  };
+
+  const int row_block_id = blockIdx.x % (kHiddenDim / kBlockRowTiles / kWmmaM);
+  const int col_block_id = blockIdx.x / (kHiddenDim / kBlockRowTiles / kWmmaM);
+  const int bias_stride = kAddBiasColsPerIter * kHiddenDim;
+  half *src_base =
+      (half *)input + row_block_id * kBlockRowTiles * kWmmaM +
+      (col_block_id * kBlockColTiles * kWmmaN +
+       threadIdx.x / kAddBiasLanesPerRow) *
+          kHiddenDim +
+      (threadIdx.x & (kAddBiasLanesPerRow - 1)) * sizeof(half2) / sizeof(half);
+  half *dst_base =
+      (half *)output + row_block_id * kBlockRowTiles * kWmmaM +
+      (col_block_id * kBlockColTiles * kWmmaN +
+       threadIdx.x / kAddBiasLanesPerRow) *
+          kHiddenDim +
+      (threadIdx.x & (kAddBiasLanesPerRow - 1)) * sizeof(half2) / sizeof(half);
+  const half *bias_base =
+      (half *)bias + row_block_id * kBlockRowTiles * kWmmaM +
+      (threadIdx.x & (kAddBiasLanesPerRow - 1)) * sizeof(half2) / sizeof(half);
+#pragma unroll
+  for (int i = 0; i < kBlockColTiles * kWmmaN / kAddBiasColsPerIter; ++i) {
+    *reinterpret_cast<half2 *>(dst_base + i * bias_stride) =
+        *reinterpret_cast<half2 *>(src_base + i * bias_stride) +
+        __ldg(reinterpret_cast<const half2 *>(bias_base));
+  }
+}
+
 __global__ void add_bias(BertInput *input, const BertWordVec *bias,
                          BertInput *output) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -783,19 +827,39 @@ __global__ void add_input(BertInput *output, const BertInput *input) {
 }
 
 __global__ void reshape_384768_1238464(BertInput *input, BertInput *output) {
-  int size_per_head = kHeadSize / 2;
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int batch_id = tid / (kHeadNum * kSeqLength * size_per_head);
-  int seq_id = (tid % (kHeadNum * kSeqLength * size_per_head)) /
-               (kHeadNum * size_per_head);
-  int head_id = (tid % (kHeadNum * size_per_head)) / size_per_head;
-  int id = tid % size_per_head;
-  int target_id = target_index(batch_id, seq_id, head_id, id, kBatchSize,
-                               kSeqLength, kHeadNum, size_per_head);
+  enum {
+    kBlockRowTiles = kBlockRowWarps * kGemmK1WarpRowTiles,
+    kBlockColTiles = kBlockColWarps * kGemmK1WarpColTiles,
+    kThreads = kBlockRowWarps * kBlockColWarps * kWarpSize,
 
-  half2 *src_ptr = reinterpret_cast<half2 *>(input);
-  half2 *dst_ptr = reinterpret_cast<half2 *>(output);
-  dst_ptr[target_id] = src_ptr[tid];
+    kStoreCLanesPerRow =
+        kWmmaM * kBlockRowTiles / (sizeof(float4) / sizeof(half)),
+    kStoreCColsPerIter = kThreads / kStoreCLanesPerRow,
+  };
+
+  const int row_block_id = blockIdx.x % (kHiddenDim / kBlockRowTiles / kWmmaM);
+  const int col_block_id = blockIdx.x / (kHiddenDim / kBlockRowTiles / kWmmaM);
+  const int reshape_dst_stride = kStoreCColsPerIter * kHeadSize;
+  const int reshape_src_stride = kStoreCColsPerIter * kHiddenDim;
+
+  half *reshape_dst_base =
+      (half *)output + (row_block_id / 2) * kHeadSize * kSeqLength +
+      (row_block_id % 2) * kBlockRowTiles * kWmmaM +
+      (col_block_id * kBlockColTiles * kWmmaN +
+       threadIdx.x / kStoreCLanesPerRow) *
+          kHeadSize +
+      (threadIdx.x & (kStoreCLanesPerRow - 1)) * sizeof(float4) / sizeof(half);
+  half *reshape_src_base =
+      (half *)input + row_block_id * kBlockRowTiles * kWmmaM +
+      (col_block_id * kBlockColTiles * kWmmaN +
+       threadIdx.x / kStoreCLanesPerRow) *
+          kHiddenDim +
+      (threadIdx.x & (kStoreCLanesPerRow - 1)) * sizeof(float4) / sizeof(half);
+#pragma unroll
+  for (int i = 0; i < kBlockColTiles * kWmmaN / kStoreCColsPerIter; ++i) {
+    *reinterpret_cast<float4 *>(reshape_dst_base + i * reshape_dst_stride) =
+        *reinterpret_cast<float4 *>(reshape_src_base + i * reshape_src_stride);
+  }
 }
 
 __global__ void softmax(half *qk_buf_, const half *attr_mask,
@@ -842,20 +906,39 @@ __global__ void softmax(half *qk_buf_, const half *attr_mask,
 }
 
 __global__ void transpose(BertInput *src, BertInput *dst) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int size_per_head = kHeadSize / 2;
-  int batch_id = tid / (kHeadNum * kSeqLength * size_per_head);
-  int head_id = (tid % (kHeadNum * kSeqLength * size_per_head)) /
-                (kSeqLength * size_per_head);
-  int seq_id = (tid % (kSeqLength * size_per_head)) / size_per_head;
-  int id = tid % size_per_head;
+  enum {
+    kBlockRowTiles = kBlockRowWarps * kGemmK3WarpRowTiles,
+    kBlockColTiles = kBlockColWarps * kGemmK3WarpColTiles,
+    kThreads = kBlockRowWarps * kBlockColWarps * kWarpSize,
+    kStoreCLanesPerRow =
+        kWmmaM * kBlockRowTiles / (sizeof(float4) / sizeof(half)),
+    kStoreCColsPerIter = kThreads / kStoreCLanesPerRow,
+  };
 
-  int target_id = target_index(batch_id, head_id, seq_id, id, kBatchSize,
-                               kHeadNum, kSeqLength, size_per_head);
-  half2 *src_ptr = reinterpret_cast<half2 *>(src);
-  half2 *dst_ptr = reinterpret_cast<half2 *>(dst);
+  const int batch_stride = kSeqLength / kBlockColTiles / kWmmaN;
+  const int batched_id = blockIdx.x / batch_stride;
+  const int col_block_id = blockIdx.x % batch_stride;
+  const int reshape_dst_stride = kStoreCColsPerIter * kHiddenDim;
+  const int reshape_src_stride = kStoreCColsPerIter * kHeadSize;
 
-  dst_ptr[target_id] = src_ptr[tid];
+  half *reshape_dst_base =
+      (half *)dst + batched_id * kHeadSize +
+      (col_block_id * kBlockColTiles * kWmmaN +
+       threadIdx.x / kStoreCLanesPerRow) *
+          kHiddenDim +
+      (threadIdx.x & (kStoreCLanesPerRow - 1)) * sizeof(float4) / sizeof(half);
+  half *reshape_src_base =
+      (half *)src + batched_id * kSeqLength * kHeadSize +
+      (col_block_id * kBlockColTiles * kWmmaN +
+       threadIdx.x / kStoreCLanesPerRow) *
+          kHeadSize +
+      (threadIdx.x & (kStoreCLanesPerRow - 1)) * sizeof(float4) / sizeof(half);
+
+#pragma unroll
+  for (int i = 0; i < kBlockColTiles * kWmmaN / kStoreCColsPerIter; ++i) {
+    *reinterpret_cast<float4 *>(reshape_dst_base + i * reshape_dst_stride) =
+        *reinterpret_cast<float4 *>(reshape_src_base + i * reshape_src_stride);
+  }
 }
 
 __global__ void gemm_k2(const half *__restrict__ matrix_a,
