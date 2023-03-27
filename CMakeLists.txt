@@ -29,4 +29,5 @@ endif()
 
 add_subdirectory(lstm)
 add_subdirectory(seq2seq)
+add_subdirectory(deepspeech2)
 add_subdirectory(bert)
