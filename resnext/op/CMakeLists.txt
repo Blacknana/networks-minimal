@@ -1,0 +1,1 @@
+add_library(resnext_kernels STATIC cuda_ops.cu)
