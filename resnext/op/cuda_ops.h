@@ -43,56 +43,14 @@ struct LinearState {
   BatchNormParam<kInSize> bn_param;
 };
 
-template <int kBatchSize, int kInSize, int kOutSize>
-struct LinearState<kBatchSize, kInSize, kOutSize, false, false> {
-  Tensor<kBatchSize * kOutSize> output;
-  Tensor<kInSize * kOutSize> weight;
-};
-
-template <int kBatchSize, int kInSize, int kOutSize>
-struct LinearState<kBatchSize, kInSize, kOutSize, true, false> {
-  Tensor<kBatchSize * kOutSize> output;
-  Tensor<kInSize * kOutSize> weight;
-  Tensor<kOutSize> bias;
-};
-
 template <int kOutputSize, int kChannel, int kFilterSize, int kColSize,
           int kBiasSize, bool kIsBias, bool kFuseBN>
 struct ConvState;
-
-template <int kOutputSize, int kChannel, int kFilterSize, int kColSize,
-          int kBiasSize>
-struct ConvState<kOutputSize, kChannel, kFilterSize, kColSize, kBiasSize, true,
-                 false> {
-  Tensor<kOutputSize> output;
-  Tensor<kFilterSize> filter;
-  Tensor<kBiasSize> bias;
-  Tensor<kColSize> col;
-};
-
-template <int kOutputSize, int kChannel, int kFilterSize, int kColSize>
-struct ConvState<kOutputSize, kChannel, kFilterSize, kColSize, 0, false,
-                 false> {
-  Tensor<kOutputSize> output;
-  Tensor<kFilterSize> filter;
-  Tensor<kColSize> col;
-};
 
 template <int kOutputSize, int kChannel, int kFilterSize, int kColSize>
 struct ConvState<kOutputSize, kChannel, kFilterSize, kColSize, 0, false, true> {
   Tensor<kOutputSize> output;
   Tensor<kFilterSize> filter;
-  BatchNormParam<kChannel> bn_param;
-  Tensor<kColSize> col;
-};
-
-template <int kOutputSize, int kChannel, int kFilterSize, int kColSize,
-          int kBiasSize>
-struct ConvState<kOutputSize, kChannel, kFilterSize, kColSize, kBiasSize, true,
-                 true> {
-  Tensor<kOutputSize> output;
-  Tensor<kFilterSize> filter;
-  Tensor<kBiasSize> bias;
   BatchNormParam<kChannel> bn_param;
   Tensor<kColSize> col;
 };
@@ -135,6 +93,26 @@ template <int kHeight, int kK, int kWidth, int kBroadCast, int kBatch1,
           int kBatch2, int kConvChannel, int kConvHeight, int kConvWidth,
           bool kFuseRelu, int kGroupSize = 1>
 __global__ void operator_fuse_conv_bn_relu_h(
+    const Tensor<kBatch1 * kHeight * kK * kGroupSize> *__restrict__ input1,
+    const Tensor<kBatch2 * kWidth * kK * kGroupSize> *__restrict__ input2,
+    Tensor<kBatch1 * kHeight * kWidth * kBatch2 * kGroupSize>
+        *__restrict__ output,
+    const BatchNormParam<kConvChannel> *__restrict__ bn_param);
+
+template <int kHeight, int kK, int kWidth, int kBroadCast, int kBatch1,
+          int kBatch2, int kConvChannel, int kConvHeight, int kConvWidth,
+          bool kFuseRelu, int kGroupSize = 1>
+__global__ void operator_conv_h(
+    const Tensor<kBatch1 * kHeight * kK * kGroupSize> *__restrict__ input1,
+    const Tensor<kBatch2 * kWidth * kK * kGroupSize> *__restrict__ input2,
+    Tensor<kBatch1 * kHeight * kWidth * kBatch2 * kGroupSize>
+        *__restrict__ output,
+    const BatchNormParam<kConvChannel> *__restrict__ bn_param);
+
+template <int kHeight, int kK, int kWidth, int kBroadCast, int kBatch1,
+          int kBatch2, int kConvChannel, int kConvHeight, int kConvWidth,
+          bool kFuseRelu, int kGroupSize = 1>
+__global__ void operator_fuse_bn_relu_h(
     const Tensor<kBatch1 * kHeight * kK * kGroupSize> *__restrict__ input1,
     const Tensor<kBatch2 * kWidth * kK * kGroupSize> *__restrict__ input2,
     Tensor<kBatch1 * kHeight * kWidth * kBatch2 * kGroupSize>

@@ -223,6 +223,111 @@ __global__ void operator_fuse_conv_bn_relu_h(
   }
 }
 
+template <int kHeight, int kK, int kWidth, int kBroadCast, int kBatch1,
+          int kBatch2, int kConvChannel, int kConvHeight, int kConvWidth,
+          bool kFuseRelu, int kGroupSize>
+__global__ void operator_conv_h(
+    const Tensor<kBatch1 * kHeight * kK * kGroupSize> *__restrict__ input1,
+    const Tensor<kBatch2 * kWidth * kK * kGroupSize> *__restrict__ input2,
+    Tensor<kBatch1 * kHeight * kWidth * kBatch2 * kGroupSize>
+        *__restrict__ output,
+    const BatchNormParam<kConvChannel> *__restrict__ bn_param) {
+
+  static_assert(kConvChannel * kConvHeight * kConvWidth ==
+                kWidth * kHeight * kGroupSize);
+
+  __shared__ float shared_input1[kTileSize][kTileSize];
+  __shared__ float shared_input2[kTileSize][kTileSize];
+
+  int block_z = blockIdx.z;
+  int batch_idx = block_z / kGroupSize;
+  int group_idx = block_z % kGroupSize;
+  int input1_off = 0;
+  int input2_off = 0;
+  int output_off = 0;
+  if (kBroadCast != 1)
+    input1_off = batch_idx * kHeight * kK * kGroupSize;
+  if (kBroadCast != 2)
+    input2_off = batch_idx * kK * kWidth * kGroupSize;
+  input1_off += group_idx * kHeight * kK;
+  input2_off += group_idx * kK * kWidth;
+
+  output_off =
+      batch_idx * kGroupSize * kHeight * kWidth + group_idx * kHeight * kWidth;
+
+  int bx = blockIdx.y;
+  int by = blockIdx.x;
+  int tx = threadIdx.y;
+  int ty = threadIdx.x;
+
+  int row = bx * kTileSize + tx;
+  int col = by * kTileSize + ty;
+  float v = 0;
+  // #pragma unroll 64
+  for (int i = 0; i < (kK + kTileSize - 1) / kTileSize; i++) {
+    if (i * kTileSize + ty < kK && row < kHeight)
+      shared_input1[tx][ty] =
+          input1->data[input1_off + row * kK + i * kTileSize + ty];
+    else
+      shared_input1[tx][ty] = 0;
+
+    if (i * kTileSize + tx < kK && col < kWidth)
+      shared_input2[tx][ty] =
+          input2->data[input2_off + (i * kTileSize + tx) * kWidth + col];
+    else
+      shared_input2[tx][ty] = 0;
+    __syncthreads();
+#pragma unroll 16
+    for (int j = 0; j < kTileSize; j++)
+      v += shared_input1[tx][j] * shared_input2[j][ty];
+    // __syncthreads();
+  }
+
+  if (row < kHeight && col < kWidth) {
+    int index = output_off + row * kWidth + col;
+    output->data[index] = v;
+  }
+}
+
+template <int kHeight, int kK, int kWidth, int kBroadCast, int kBatch1,
+          int kBatch2, int kConvChannel, int kConvHeight, int kConvWidth,
+          bool kFuseRelu, int kGroupSize>
+__global__ void operator_fuse_bn_relu_h(
+    const Tensor<kBatch1 * kHeight * kK * kGroupSize> *__restrict__ input1,
+    const Tensor<kBatch2 * kWidth * kK * kGroupSize> *__restrict__ input2,
+    Tensor<kBatch1 * kHeight * kWidth * kBatch2 * kGroupSize>
+        *__restrict__ output,
+    const BatchNormParam<kConvChannel> *__restrict__ bn_param) {
+
+  static_assert(kConvChannel * kConvHeight * kConvWidth ==
+                kWidth * kHeight * kGroupSize);
+
+  int block_z = blockIdx.z;
+  int batch_idx = block_z / kGroupSize;
+  int group_idx = block_z % kGroupSize;
+  int output_off = batch_idx * kGroupSize * kHeight * kWidth + group_idx * kHeight * kWidth;
+
+  int bx = blockIdx.y;
+  int by = blockIdx.x;
+  int tx = threadIdx.y;
+  int ty = threadIdx.x;
+
+  int row = bx * kTileSize + tx;
+  int col = by * kTileSize + ty;
+  int index = output_off + row * kWidth + col;
+  float v = output->data[index];
+
+  if (row < kHeight && col < kWidth) {
+    v = batch_normalization_func<kBatch2, kConvChannel, kConvHeight,
+                                 kConvWidth>(v, bn_param, index);
+    if constexpr (kFuseRelu) {
+      output->data[index] = v > 0 ? v : 0;
+    } else {
+      output->data[index] = v;
+    }
+  }
+}
+
 template <int kBatchSize, int kHeight, int kWidth, int kChannelIn,
           int kChannelOut, int kKernelH, int kKernelW, int kPadH, int kPadW,
           int kStrideH, int kStrideW, bool kIsBias, int kInputSize,
@@ -524,6 +629,224 @@ operator_fuse_conv_bn_relu_h<256, 128, 3136, 1, 1, 1, 256, 56, 56, false, 1>(
     BatchNormParam<256> const *);
 template __global__ void
 operator_fuse_conv_bn_relu_h<256, 256, 3136, 1, 1, 1, 256, 56, 56, true, 1>(
+    Tensor<(((1) * (256)) * (256)) * (1)> const *,
+    Tensor<(((1) * (3136)) * (256)) * (1)> const *,
+    Tensor<((((1) * (256)) * (3136)) * (1)) * (1)> *,
+    BatchNormParam<256> const *);
+
+template __global__ void
+operator_conv_h<64, 147, 12544, 1, 1, 1, 64, 112, 112, true, 1>(
+    Tensor<(((1) * (64)) * (147)) * (1)> const *,
+    Tensor<(((1) * (12544)) * (147)) * (1)> const *,
+    Tensor<((((1) * (64)) * (12544)) * (1)) * (1)> *,
+    BatchNormParam<64> const *);
+template __global__ void
+operator_conv_h<2048, 1024, 49, 1, 1, 1, 2048, 7, 7, false, 1>(
+    Tensor<(((1) * (2048)) * (1024)) * (1)> const *,
+    Tensor<(((1) * (49)) * (1024)) * (1)> const *,
+    Tensor<((((1) * (2048)) * (49)) * (1)) * (1)> *,
+    BatchNormParam<2048> const *);
+template __global__ void
+operator_conv_h<512, 1024, 196, 1, 1, 1, 512, 14, 14, true, 1>(
+    Tensor<(((1) * (512)) * (1024)) * (1)> const *,
+    Tensor<(((1) * (196)) * (1024)) * (1)> const *,
+    Tensor<((((1) * (512)) * (196)) * (1)) * (1)> *,
+    BatchNormParam<512> const *);
+template __global__ void
+operator_conv_h<1024, 512, 196, 1, 1, 1, 1024, 14, 14, false, 1>(
+    Tensor<(((1) * (1024)) * (512)) * (1)> const *,
+    Tensor<(((1) * (196)) * (512)) * (1)> const *,
+    Tensor<((((1) * (1024)) * (196)) * (1)) * (1)> *,
+    BatchNormParam<1024> const *);
+template __global__ void
+operator_conv_h<256, 512, 784, 1, 1, 1, 256, 28, 28, true, 1>(
+    Tensor<(((1) * (256)) * (512)) * (1)> const *,
+    Tensor<(((1) * (784)) * (512)) * (1)> const *,
+    Tensor<((((1) * (256)) * (784)) * (1)) * (1)> *,
+    BatchNormParam<256> const *);
+template __global__ void
+operator_conv_h<512, 256, 784, 1, 1, 1, 512, 28, 28, false, 1>(
+    Tensor<(((1) * (512)) * (256)) * (1)> const *,
+    Tensor<(((1) * (784)) * (256)) * (1)> const *,
+    Tensor<((((1) * (512)) * (784)) * (1)) * (1)> *,
+    BatchNormParam<512> const *);
+template __global__ void
+operator_conv_h<256, 64, 3136, 1, 1, 1, 256, 56, 56, false, 1>(
+    Tensor<(((1) * (256)) * (64)) * (1)> const *,
+    Tensor<(((1) * (3136)) * (64)) * (1)> const *,
+    Tensor<((((1) * (256)) * (3136)) * (1)) * (1)> *,
+    BatchNormParam<256> const *);
+template __global__ void
+operator_conv_h<128, 256, 3136, 1, 1, 1, 128, 56, 56, true, 1>(
+    Tensor<(((1) * (128)) * (256)) * (1)> const *,
+    Tensor<(((1) * (3136)) * (256)) * (1)> const *,
+    Tensor<((((1) * (128)) * (3136)) * (1)) * (1)> *,
+    BatchNormParam<128> const *);
+template __global__ void
+operator_conv_h<32, 288, 49, 1, 1, 1, 1024, 7, 7, true, 32>(
+    Tensor<(((1) * (32)) * (288)) * (32)> const *,
+    Tensor<(((1) * (49)) * (288)) * (32)> const *,
+    Tensor<((((1) * (32)) * (49)) * (1)) * (32)> *,
+    BatchNormParam<1024> const *);
+template __global__ void
+operator_conv_h<1024, 2048, 49, 1, 1, 1, 1024, 7, 7, true, 1>(
+    Tensor<(((1) * (1024)) * (2048)) * (1)> const *,
+    Tensor<(((1) * (49)) * (2048)) * (1)> const *,
+    Tensor<((((1) * (1024)) * (49)) * (1)) * (1)> *,
+    BatchNormParam<1024> const *);
+template __global__ void
+operator_conv_h<1024, 1024, 196, 1, 1, 1, 1024, 14, 14, true, 1>(
+    Tensor<(((1) * (1024)) * (1024)) * (1)> const *,
+    Tensor<(((1) * (196)) * (1024)) * (1)> const *,
+    Tensor<((((1) * (1024)) * (196)) * (1)) * (1)> *,
+    BatchNormParam<1024> const *);
+template __global__ void
+operator_conv_h<16, 144, 196, 1, 1, 1, 512, 14, 14, true, 32>(
+    Tensor<(((1) * (16)) * (144)) * (32)> const *,
+    Tensor<(((1) * (196)) * (144)) * (32)> const *,
+    Tensor<((((1) * (16)) * (196)) * (1)) * (32)> *,
+    BatchNormParam<512> const *);
+template __global__ void
+operator_conv_h<128, 64, 3136, 1, 1, 1, 128, 56, 56, true, 1>(
+    Tensor<(((1) * (128)) * (64)) * (1)> const *,
+    Tensor<(((1) * (3136)) * (64)) * (1)> const *,
+    Tensor<((((1) * (128)) * (3136)) * (1)) * (1)> *,
+    BatchNormParam<128> const *);
+template __global__ void
+operator_conv_h<512, 512, 784, 1, 1, 1, 512, 28, 28, true, 1>(
+    Tensor<(((1) * (512)) * (512)) * (1)> const *,
+    Tensor<(((1) * (784)) * (512)) * (1)> const *,
+    Tensor<((((1) * (512)) * (784)) * (1)) * (1)> *,
+    BatchNormParam<512> const *);
+template __global__ void
+operator_conv_h<8, 72, 784, 1, 1, 1, 256, 28, 28, true, 32>(
+    Tensor<(((1) * (8)) * (72)) * (32)> const *,
+    Tensor<(((1) * (784)) * (72)) * (32)> const *,
+    Tensor<((((1) * (8)) * (784)) * (1)) * (32)> *,
+    BatchNormParam<256> const *);
+template __global__ void
+operator_conv_h<4, 36, 3136, 1, 1, 1, 128, 56, 56, true, 32>(
+    Tensor<(((1) * (4)) * (36)) * (32)> const *,
+    Tensor<(((1) * (3136)) * (36)) * (32)> const *,
+    Tensor<((((1) * (4)) * (3136)) * (1)) * (32)> *,
+    BatchNormParam<128> const *);
+template __global__ void
+operator_conv_h<256, 128, 3136, 1, 1, 1, 256, 56, 56, false, 1>(
+    Tensor<(((1) * (256)) * (128)) * (1)> const *,
+    Tensor<(((1) * (3136)) * (128)) * (1)> const *,
+    Tensor<((((1) * (256)) * (3136)) * (1)) * (1)> *,
+    BatchNormParam<256> const *);
+template __global__ void
+operator_conv_h<256, 256, 3136, 1, 1, 1, 256, 56, 56, true, 1>(
+    Tensor<(((1) * (256)) * (256)) * (1)> const *,
+    Tensor<(((1) * (3136)) * (256)) * (1)> const *,
+    Tensor<((((1) * (256)) * (3136)) * (1)) * (1)> *,
+    BatchNormParam<256> const *);
+
+template __global__ void
+operator_fuse_bn_relu_h<64, 147, 12544, 1, 1, 1, 64, 112, 112, true, 1>(
+    Tensor<(((1) * (64)) * (147)) * (1)> const *,
+    Tensor<(((1) * (12544)) * (147)) * (1)> const *,
+    Tensor<((((1) * (64)) * (12544)) * (1)) * (1)> *,
+    BatchNormParam<64> const *);
+template __global__ void
+operator_fuse_bn_relu_h<2048, 1024, 49, 1, 1, 1, 2048, 7, 7, false, 1>(
+    Tensor<(((1) * (2048)) * (1024)) * (1)> const *,
+    Tensor<(((1) * (49)) * (1024)) * (1)> const *,
+    Tensor<((((1) * (2048)) * (49)) * (1)) * (1)> *,
+    BatchNormParam<2048> const *);
+template __global__ void
+operator_fuse_bn_relu_h<512, 1024, 196, 1, 1, 1, 512, 14, 14, true, 1>(
+    Tensor<(((1) * (512)) * (1024)) * (1)> const *,
+    Tensor<(((1) * (196)) * (1024)) * (1)> const *,
+    Tensor<((((1) * (512)) * (196)) * (1)) * (1)> *,
+    BatchNormParam<512> const *);
+template __global__ void
+operator_fuse_bn_relu_h<1024, 512, 196, 1, 1, 1, 1024, 14, 14, false, 1>(
+    Tensor<(((1) * (1024)) * (512)) * (1)> const *,
+    Tensor<(((1) * (196)) * (512)) * (1)> const *,
+    Tensor<((((1) * (1024)) * (196)) * (1)) * (1)> *,
+    BatchNormParam<1024> const *);
+template __global__ void
+operator_fuse_bn_relu_h<256, 512, 784, 1, 1, 1, 256, 28, 28, true, 1>(
+    Tensor<(((1) * (256)) * (512)) * (1)> const *,
+    Tensor<(((1) * (784)) * (512)) * (1)> const *,
+    Tensor<((((1) * (256)) * (784)) * (1)) * (1)> *,
+    BatchNormParam<256> const *);
+template __global__ void
+operator_fuse_bn_relu_h<512, 256, 784, 1, 1, 1, 512, 28, 28, false, 1>(
+    Tensor<(((1) * (512)) * (256)) * (1)> const *,
+    Tensor<(((1) * (784)) * (256)) * (1)> const *,
+    Tensor<((((1) * (512)) * (784)) * (1)) * (1)> *,
+    BatchNormParam<512> const *);
+template __global__ void
+operator_fuse_bn_relu_h<256, 64, 3136, 1, 1, 1, 256, 56, 56, false, 1>(
+    Tensor<(((1) * (256)) * (64)) * (1)> const *,
+    Tensor<(((1) * (3136)) * (64)) * (1)> const *,
+    Tensor<((((1) * (256)) * (3136)) * (1)) * (1)> *,
+    BatchNormParam<256> const *);
+template __global__ void
+operator_fuse_bn_relu_h<128, 256, 3136, 1, 1, 1, 128, 56, 56, true, 1>(
+    Tensor<(((1) * (128)) * (256)) * (1)> const *,
+    Tensor<(((1) * (3136)) * (256)) * (1)> const *,
+    Tensor<((((1) * (128)) * (3136)) * (1)) * (1)> *,
+    BatchNormParam<128> const *);
+template __global__ void
+operator_fuse_bn_relu_h<32, 288, 49, 1, 1, 1, 1024, 7, 7, true, 32>(
+    Tensor<(((1) * (32)) * (288)) * (32)> const *,
+    Tensor<(((1) * (49)) * (288)) * (32)> const *,
+    Tensor<((((1) * (32)) * (49)) * (1)) * (32)> *,
+    BatchNormParam<1024> const *);
+template __global__ void
+operator_fuse_bn_relu_h<1024, 2048, 49, 1, 1, 1, 1024, 7, 7, true, 1>(
+    Tensor<(((1) * (1024)) * (2048)) * (1)> const *,
+    Tensor<(((1) * (49)) * (2048)) * (1)> const *,
+    Tensor<((((1) * (1024)) * (49)) * (1)) * (1)> *,
+    BatchNormParam<1024> const *);
+template __global__ void
+operator_fuse_bn_relu_h<1024, 1024, 196, 1, 1, 1, 1024, 14, 14, true, 1>(
+    Tensor<(((1) * (1024)) * (1024)) * (1)> const *,
+    Tensor<(((1) * (196)) * (1024)) * (1)> const *,
+    Tensor<((((1) * (1024)) * (196)) * (1)) * (1)> *,
+    BatchNormParam<1024> const *);
+template __global__ void
+operator_fuse_bn_relu_h<16, 144, 196, 1, 1, 1, 512, 14, 14, true, 32>(
+    Tensor<(((1) * (16)) * (144)) * (32)> const *,
+    Tensor<(((1) * (196)) * (144)) * (32)> const *,
+    Tensor<((((1) * (16)) * (196)) * (1)) * (32)> *,
+    BatchNormParam<512> const *);
+template __global__ void
+operator_fuse_bn_relu_h<128, 64, 3136, 1, 1, 1, 128, 56, 56, true, 1>(
+    Tensor<(((1) * (128)) * (64)) * (1)> const *,
+    Tensor<(((1) * (3136)) * (64)) * (1)> const *,
+    Tensor<((((1) * (128)) * (3136)) * (1)) * (1)> *,
+    BatchNormParam<128> const *);
+template __global__ void
+operator_fuse_bn_relu_h<512, 512, 784, 1, 1, 1, 512, 28, 28, true, 1>(
+    Tensor<(((1) * (512)) * (512)) * (1)> const *,
+    Tensor<(((1) * (784)) * (512)) * (1)> const *,
+    Tensor<((((1) * (512)) * (784)) * (1)) * (1)> *,
+    BatchNormParam<512> const *);
+template __global__ void
+operator_fuse_bn_relu_h<8, 72, 784, 1, 1, 1, 256, 28, 28, true, 32>(
+    Tensor<(((1) * (8)) * (72)) * (32)> const *,
+    Tensor<(((1) * (784)) * (72)) * (32)> const *,
+    Tensor<((((1) * (8)) * (784)) * (1)) * (32)> *,
+    BatchNormParam<256> const *);
+template __global__ void
+operator_fuse_bn_relu_h<4, 36, 3136, 1, 1, 1, 128, 56, 56, true, 32>(
+    Tensor<(((1) * (4)) * (36)) * (32)> const *,
+    Tensor<(((1) * (3136)) * (36)) * (32)> const *,
+    Tensor<((((1) * (4)) * (3136)) * (1)) * (32)> *,
+    BatchNormParam<128> const *);
+template __global__ void
+operator_fuse_bn_relu_h<256, 128, 3136, 1, 1, 1, 256, 56, 56, false, 1>(
+    Tensor<(((1) * (256)) * (128)) * (1)> const *,
+    Tensor<(((1) * (3136)) * (128)) * (1)> const *,
+    Tensor<((((1) * (256)) * (3136)) * (1)) * (1)> *,
+    BatchNormParam<256> const *);
+template __global__ void
+operator_fuse_bn_relu_h<256, 256, 3136, 1, 1, 1, 256, 56, 56, true, 1>(
     Tensor<(((1) * (256)) * (256)) * (1)> const *,
     Tensor<(((1) * (3136)) * (256)) * (1)> const *,
     Tensor<((((1) * (256)) * (3136)) * (1)) * (1)> *,
