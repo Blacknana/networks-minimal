@@ -9,4 +9,8 @@ file(ARCHIVE_EXTRACT INPUT ${nasnet_data_path})
 add_executable(nasnet nasnet.cpp)   
 target_link_libraries(nasnet nasnet_kernel)
 
+add_executable(nasnet_base nasnet.cpp)   
+target_link_libraries(nasnet_base base_kernel)
+
 add_subdirectory(kernels)
+add_subdirectory(base_kernels)
