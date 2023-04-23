@@ -12,5 +12,9 @@ target_link_libraries(nasnet nasnet_kernel)
 add_executable(nasnet_base nasnet.cpp)   
 target_link_libraries(nasnet_base base_kernel)
 
+add_executable(nasnet_rammer nasnet.cpp)
+target_link_libraries(nasnet_rammer rammer_kernel)
+
 add_subdirectory(kernels)
 add_subdirectory(base_kernels)
+add_subdirectory(rammer_kernels)
