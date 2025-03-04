@@ -11,3 +11,6 @@ target_link_libraries(wavefront_lstm gtest gtest_main CUDA::cuda_driver absl::ba
 
 add_executable(naive_lstm base.cu)
 target_link_libraries(naive_lstm gtest gtest_main CUDA::cuda_driver absl::base)
+
+add_executable(wavefront_lstm_c lstm_c.cpp)
+target_link_libraries(wavefront_lstm_c gtest gtest_main absl::base)

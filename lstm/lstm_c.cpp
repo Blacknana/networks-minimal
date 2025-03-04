@@ -1,0 +1,280 @@
+#include "gtest/gtest.h"
+#include <absl/types/span.h>
+#include <fstream>
+#include <cmath>
+
+namespace lstm {
+enum LSTMScaleParams {
+  kLstmGateNumber = 4,
+  kHiddenSize = 256,
+  kInputSize = 256,
+  kCellNumber = 10,
+  kLstmTimestep = 100,
+};
+
+enum LSTMKernelScaleParams {
+  kThreadsPerWarp = 32,
+  kWarpsPerBlock = 8,
+  kColumnsPerBlock = kThreadsPerWarp,
+  kGemvBlockNumber = kHiddenSize / kColumnsPerBlock,
+  kRowsPerWarp = kHiddenSize / kWarpsPerBlock,
+};
+
+struct CellModel {
+  float weights_w[kLstmGateNumber][kInputSize][kHiddenSize];
+  float weights_u[kLstmGateNumber][kHiddenSize][kHiddenSize];
+  float bias[kLstmGateNumber][kHiddenSize];
+};
+static_assert(sizeof(CellModel) == sizeof(CellModel::weights_w) +
+                                       sizeof(CellModel::weights_u) +
+                                       sizeof(CellModel::bias),
+              "Expect the data to be placed continuously.");
+
+#pragma pack(push, 1)
+struct ModelParams {
+  CellModel cell_model[kCellNumber];
+};
+#pragma pack(pop)
+
+struct CellState {
+  float data[kHiddenSize];
+};
+
+struct CellTemp {
+  float data[kLstmGateNumber][kHiddenSize];
+};
+
+#pragma pack(push, 1)
+struct CellParams {
+  CellState cell_state_h[kCellNumber + 1][kLstmTimestep + 1];
+  CellState cell_state_c[kCellNumber];
+  CellTemp cell_temp[kCellNumber];
+};
+#pragma pack(pop)
+} // namespace lstm
+
+using namespace lstm;
+
+#pragma pack(push, 1)
+struct WaveKernelParams {
+    void * d_model_params;
+    void * d_cell_params;
+    int step_start_num;
+    int layer_start_num;
+};
+#pragma pack(pop)
+
+class Wave {
+public:
+  explicit Wave();
+  void InitCellParams(void *d_cell_params);
+  void Finalize();
+};
+
+class WavefrontLSTM {
+public:
+  explicit WavefrontLSTM(absl::Span<const float> src_model);
+  bool Initialize(absl::Span<const float> input);
+  void Solve();
+  bool Fetch(absl::Span<float> output);
+  void Finalize();
+
+private:
+ Wave wave_;
+ void *d_model_params_;
+ void *d_cell_params_;
+ void *d_input_;
+ void *d_output_;
+};
+// 改写为C++函数
+void wave_compute_cpu(int block_x, int grid_x, ModelParams *d_model_params,
+                             CellParams *d_cell_params, int step_start_num,
+                             int layer_start_num);
+
+std::vector<float> ReadFloatFromFile(const std::string &path) {
+  std::ifstream in_file(path);
+  if (!in_file.is_open()) {
+    std::cout << "无法打开文件: " << path << std::endl;
+    exit(1);
+  }
+  in_file.setf(std::ios::fixed, std::ios::floatfield);
+  return std::vector<float>(std::istream_iterator<float>(in_file),
+                            std::istream_iterator<float>());
+}
+
+TEST(TestLSTM, test_wavefront_lstm) {
+  auto model = ReadFloatFromFile("model_params.txt");
+  auto input = ReadFloatFromFile("input_params.txt");
+  auto expect_result = ReadFloatFromFile("expect_results.txt");
+  std::vector<float> output_result_buffer(expect_result.size());
+  absl::Span<float> output(output_result_buffer);
+  auto network = new WavefrontLSTM(model);
+
+  ASSERT_TRUE(network->Initialize(input));
+  network->Solve();
+  ASSERT_TRUE(network->Fetch(output));
+  for (unsigned int i = 0; i < expect_result.size(); ++i) {
+    ASSERT_NEAR(output[i], expect_result[i], 1e-5);
+  }
+
+  enum { kWarmUp = 0, kLoop = 1 };
+  // Warm-up, 100 times
+  for (int i = 0; i < kWarmUp; i++) {
+    network->Initialize(input);
+    network->Solve();
+    network->Fetch(output);
+  }
+  double min_ms = std::numeric_limits<double>::max();
+  double max_ms = std::numeric_limits<double>::min();
+  double total_ms = 0.00000f;
+  for (int i = 0; i < kLoop; i++) {
+    auto start = std::chrono::steady_clock::now();
+    network->Initialize(input);
+    network->Solve();
+    network->Fetch(output);
+    auto end = std::chrono::steady_clock::now();
+    std::chrono::duration<double, std::micro> elapsed = end - start;
+    double iteration_ms = elapsed.count();
+    printf("Iteration time %f us\n", iteration_ms);
+    min_ms = std::min(iteration_ms, min_ms);
+    max_ms = std::max(iteration_ms, max_ms);
+    total_ms = total_ms + iteration_ms;
+  }
+  printf("Sumamry: [min, max, mean] = [%f, %f, %f] us\n", min_ms, max_ms,
+         total_ms / kLoop);
+
+  network->Finalize();
+}
+
+Wave::Wave() {
+}
+
+void Wave::Finalize() {}
+
+
+void Wave::InitCellParams(void * d_cell_params) {
+  memset(
+      d_cell_params, 0,
+      (sizeof(CellParams::cell_state_h) + sizeof(CellParams::cell_state_c)) /
+          sizeof(float));
+}
+
+WavefrontLSTM::WavefrontLSTM(absl::Span<const float> src_model) {
+  d_model_params_ = malloc(sizeof(ModelParams));
+  d_cell_params_ = malloc(sizeof(CellParams));
+  if (d_model_params_ == nullptr || d_cell_params_ == nullptr) {
+    std::cout << "malloc failed" << std::endl;
+    return;
+  }
+  memcpy(d_model_params_, src_model.data(), sizeof(ModelParams));
+  d_input_ = d_cell_params_ + sizeof(CellState);
+  d_output_ = d_cell_params_ + sizeof(CellParams::cell_state_h) -
+              kLstmTimestep * sizeof(CellState);
+}
+
+bool WavefrontLSTM::Initialize(absl::Span<const float> input) {
+  if (input.size() != sizeof(CellState) * kLstmTimestep / sizeof(float)) {
+    return false;
+  }
+
+  wave_.InitCellParams(d_cell_params_);
+      memcpy(d_input_, input.data(), sizeof(CellState) * kLstmTimestep);
+  return true;
+}
+
+void WavefrontLSTM::Solve() {
+  const int max_wave_size = std::min(kCellNumber, kLstmTimestep);
+  const int max_wave_number = kCellNumber + kLstmTimestep - 1;
+
+  for (int wave_idx = 1; wave_idx <= max_wave_number; ++wave_idx) {
+    int wave_size = (wave_idx < std::max(kCellNumber, kLstmTimestep))
+                        ? std::min(wave_idx, max_wave_size)
+                        : (max_wave_size -
+                           (wave_idx - std::max(kCellNumber, kLstmTimestep)));
+    int step_start_num = (wave_idx < kLstmTimestep) ? wave_idx : kLstmTimestep;
+    int layer_start_num =
+        (wave_idx < kLstmTimestep) ? 1 : (wave_idx - kLstmTimestep + 1);
+
+    WaveKernelParams kernel_params = {d_model_params_, d_cell_params_,
+                                      step_start_num, layer_start_num};
+    wave_compute_cpu(kGemvBlockNumber * wave_size, kHiddenSize, (ModelParams*)d_model_params_, (CellParams*)d_cell_params_, step_start_num, layer_start_num);
+  }
+}
+
+bool WavefrontLSTM::Fetch(absl::Span<float> output) {
+    memcpy(output.data(), d_output_, sizeof(CellState) * kLstmTimestep);
+  return true;
+}
+
+void WavefrontLSTM::Finalize() {
+  free((void*)d_model_params_);
+  free((void*)d_cell_params_);
+  wave_.Finalize();
+}
+
+float sigmoid(float x) {
+  return 1.000000e+00f / (1.000000e+00f + std::exp(-x));
+}
+
+void wave_compute_cpu(int grid_x, int block_x, ModelParams *d_model_params, CellParams *d_cell_params,
+                 int step_start_num, int layer_start_num) {
+  for (int block_idx = 0; block_idx < grid_x; ++block_idx) {
+    // 初始化temp为0
+    float temp[kLstmGateNumber][kHiddenSize];
+    memset(temp, 0, sizeof(temp));
+    const int cell_idx = layer_start_num + block_idx / kGemvBlockNumber;
+    const int step_idx = step_start_num - block_idx / kGemvBlockNumber;
+    CellState *d_input = &d_cell_params->cell_state_h[cell_idx - 1][step_idx];
+    CellState *d_input_state_h =
+        &d_cell_params->cell_state_h[cell_idx][step_idx - 1];
+    CellState *d_output_state_h =
+        &d_cell_params->cell_state_h[cell_idx][step_idx];
+    CellState *d_state_c = &d_cell_params->cell_state_c[cell_idx - 1];
+    CellTemp *d_temp = &d_cell_params->cell_temp[cell_idx - 1];
+    CellModel *d_model = &d_model_params->cell_model[cell_idx - 1];
+    // 初始化d_temp->data为0
+    memset(d_temp->data, 0, sizeof(d_temp->data));
+    for (int thread_idx = 0; thread_idx < block_x; ++thread_idx) {
+        const int warp_idx = thread_idx / kThreadsPerWarp;
+        const int lane_idx = thread_idx % kThreadsPerWarp;
+        const int col_idx =
+            (block_idx % kGemvBlockNumber) * kColumnsPerBlock + lane_idx;
+
+        const int row_start_idx = kRowsPerWarp * warp_idx;
+        const int row_end_idx = row_start_idx + kRowsPerWarp;
+        for (int row_idx = row_start_idx; row_idx < row_end_idx; ++row_idx) {
+            float input_data = d_input->data[row_idx];
+            float state_h_data = d_input_state_h->data[row_idx];
+            for (int i = 0; i < kLstmGateNumber; ++i) {
+                temp[i][thread_idx] += d_model->weights_w[i][row_idx][col_idx] * input_data;
+                temp[i][thread_idx] += d_model->weights_u[i][row_idx][col_idx] * state_h_data;
+            }
+        }
+
+        for (int i = 0; i < kLstmGateNumber; ++i) {
+            d_temp->data[i][col_idx] += temp[i][thread_idx];
+        }
+
+    }
+    for (int thread_idx = 0; thread_idx < block_x; ++thread_idx) {
+        const int warp_idx = thread_idx / kThreadsPerWarp;
+        const int lane_idx = thread_idx % kThreadsPerWarp;
+        const int col_idx =
+            (block_idx % kGemvBlockNumber) * kColumnsPerBlock + lane_idx;
+        if (warp_idx == 0) {
+            float input_gate_x = d_temp->data[0][col_idx] + d_model->bias[0][col_idx];
+            float input_gate_y = d_temp->data[1][col_idx] + d_model->bias[1][col_idx];
+            float forget_gate = d_temp->data[2][col_idx] + d_model->bias[2][col_idx];
+            float output_gate = d_temp->data[3][col_idx] + d_model->bias[3][col_idx];
+            input_gate_x = sigmoid(input_gate_x);
+            input_gate_y = std::tanh(input_gate_y);
+            output_gate = sigmoid(output_gate);
+            forget_gate =
+                sigmoid(forget_gate + 1.000000e+00f) * d_state_c->data[col_idx];
+            d_state_c->data[col_idx] = fma(input_gate_x, input_gate_y, forget_gate);
+            d_output_state_h->data[col_idx] =
+                (std::tanh(d_state_c->data[col_idx])) * output_gate;
+        }
+    }
+  }
+}
