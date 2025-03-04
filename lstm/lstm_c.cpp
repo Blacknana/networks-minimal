@@ -155,8 +155,7 @@ void Wave::Finalize() {}
 void Wave::InitCellParams(void * d_cell_params) {
   memset(
       d_cell_params, 0,
-      (sizeof(CellParams::cell_state_h) + sizeof(CellParams::cell_state_c)) /
-          sizeof(float));
+      (sizeof(CellParams::cell_state_h) + sizeof(CellParams::cell_state_c)));
 }
 
 WavefrontLSTM::WavefrontLSTM(absl::Span<const float> src_model) {
